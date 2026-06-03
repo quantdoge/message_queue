@@ -1,5 +1,33 @@
 services:
+  # The Redis server that holds the task queue.
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+    # Let other services wait until Redis is actually ready to accept commands.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # Background workers. Scale to several at once with:
+  #   docker compose up --build --scale worker=3
+  worker:
+    build: .
+    command: python worker.py
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Runs once to drop a batch of tasks on the queue, then exits.
+  producer:
+    build: .
+    command: python producer.py
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy

@@ -33,7 +33,32 @@ to exactly one worker — that is how the work is shared.
 | `producer.py`    | makes up sample tasks and enqueues them |
 | `demo.py`        | runs producer + several workers together in one process |
 
-## Running it
+## Running it with Docker (everything in one command)
+
+No separate terminals needed — Redis, the workers, and the producer all run as
+containers:
+
+```bash
+docker compose up --build --scale worker=3
+```
+
+This starts Redis, 3 background workers, and the producer (which enqueues 10
+tasks and exits). You'll see the workers' logs stream and interleave as they
+share the tasks. Stop everything with `Ctrl-C`, then clean up with:
+
+```bash
+docker compose down
+```
+
+To enqueue another batch while the workers keep running:
+
+```bash
+docker compose run --rm producer
+```
+
+(Adjust `--scale worker=N` for more or fewer workers.)
+
+## Running it locally (without Docker)
 
 ### 1. Start Redis
 
