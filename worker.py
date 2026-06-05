@@ -1,8 +1,12 @@
-"""A background worker that pulls tasks off the queue and processes them.
+"""A background worker that claims tasks from the queue and processes them.
 
-Run several of these (in threads via demo.py, or as separate processes in
-separate terminals) and they will each grab different tasks from the same
-Redis queue -- that is how the work gets spread out.
+Run several of these (in threads via demo.py) and they will each claim
+different pending rows from the same DuckDB table -- that is how the work
+gets spread out.
+
+Note: DuckDB allows only ONE process to open the database file read-write at a
+time, so don't run this standalone alongside another process (e.g. producer.py)
+that also opens the same file. The all-in-one demo.py is the normal way to run.
 """
 
 import threading
@@ -12,7 +16,7 @@ from task_queue import TaskQueue
 
 
 class Worker:
-    """Pops tasks from a TaskQueue and 'processes' them until told to stop."""
+    """Claims tasks from a TaskQueue and 'processes' them until told to stop."""
 
     def __init__(self, name: str, queue: TaskQueue):
         self.name = name
@@ -26,15 +30,16 @@ class Worker:
         self._stop.set()
 
     def run(self) -> None:
-        """Main loop: wait for a task, process it, repeat."""
+        """Main loop: claim a task, process it, mark it done, repeat."""
         print(f"[{self.name}] started, waiting for tasks...")
         while not self._stop.is_set():
-            # Block up to 2s for a task. If none arrives we loop back and
+            # Poll up to 2s for a task. If none arrives we loop back and
             # re-check the stop flag, so shutdown is responsive.
             task = self.queue.dequeue(timeout=2)
             if task is None:
                 continue
             self.process(task)
+            self.queue.complete(task)
         print(f"[{self.name}] stopped.")
 
     def process(self, task: dict) -> None:
@@ -47,6 +52,7 @@ class Worker:
 
 if __name__ == "__main__":
     # Standalone mode: run one worker that keeps going until you Ctrl-C it.
+    # (Make sure no other process has the DuckDB file open read-write.)
     worker = Worker(name="worker-standalone", queue=TaskQueue())
     try:
         worker.run()

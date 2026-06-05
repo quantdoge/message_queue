@@ -1,103 +1,90 @@
-# Redis Task Queue Demo
+# DuckDB Task Queue Demo
 
-A small, easy-to-read demonstration of the classic **task queue** pattern:
+A small, easy-to-read demonstration of the classic **task queue** pattern, using
+**DuckDB** (an embedded database) as the store:
 
 ```
-producer  --enqueue-->  [ Redis list ]  --dequeue-->  background workers
+producer  --INSERT-->  [ tasks table in DuckDB ]  --CLAIM-->  background workers
 ```
 
-A **producer** drops tasks onto a queue, and one or more **background workers**
-pull tasks off the queue and process them. Redis stores the queue.
+A **producer** inserts tasks into a table, and one or more **background workers**
+claim pending rows and process them. The queue is persisted to a DuckDB file.
 
-## How Redis is used
+## How DuckDB is used
 
-The queue is a single Redis **list**, and the whole pattern is three commands:
+DuckDB is embedded (like SQLite), not a server — there is no blocking pop or
+pub/sub. So the queue is just a table, and each task moves through three states:
 
-| Action  | Redis command | Why |
-|---------|---------------|-----|
-| enqueue | `LPUSH`       | push a task onto the **left** of the list |
-| dequeue | `BRPOP`       | **blocking** pop from the **right** of the list |
-| size    | `LLEN`        | how many tasks are waiting |
+```
+pending  --claimed by a worker-->  processing  --finished-->  done
+```
 
-Pushing on the left and popping from the right gives **FIFO** order (oldest task
-runs next). `BRPOP` blocks until a task exists, so idle workers sleep instead of
-busy-looping. Because every worker pops from the same list, Redis hands each task
-to exactly one worker — that is how the work is shared.
+| Action   | SQL | Why |
+|----------|-----|-----|
+| enqueue  | `INSERT` a row with status `pending` | add work |
+| dequeue  | `UPDATE ... SET status='processing' WHERE row_id = (oldest pending) RETURNING ...` | atomically **claim** one task |
+| complete | `UPDATE ... SET status='done'` | mark it finished |
+| size     | `SELECT count(*) ... WHERE status <> 'done'` | how much work is left |
+
+Ordering by an auto-incrementing `row_id` gives **FIFO** (oldest pending runs
+next). There's no blocking pop, so workers **poll**: claim the next task, or wait
+briefly and try again.
+
+### Important: one writer process at a time
+
+DuckDB lets only **one process** open the database file read-write at a time.
+So unlike a Redis broker, you can't scale workers across separate
+processes/containers on the same file. The demo instead runs as **one process
+with several worker threads** sharing a single connection (guarded by a lock).
+The DB calls are fast and serialized; the simulated *work* still overlaps across
+threads, so you still see real concurrency.
 
 ## Files
 
 | File             | What it is |
 |------------------|------------|
-| `task_queue.py`  | `TaskQueue` class — the `enqueue` / `dequeue` / `size` wrapper around Redis |
-| `worker.py`      | `Worker` class — the loop that pops tasks and processes them |
-| `producer.py`    | makes up sample tasks and enqueues them |
-| `demo.py`        | runs producer + several workers together in one process |
+| `task_queue.py`  | `TaskQueue` class — `enqueue` / `dequeue` (claim) / `complete` / `size` over a DuckDB table |
+| `worker.py`      | `Worker` class — the loop that claims tasks, processes them, marks them done |
+| `producer.py`    | makes up sample tasks and inserts them |
+| `demo.py`        | runs producer + several worker threads together in one process |
 
-## Running it with Docker (everything in one command)
+## Running it locally
 
-No separate terminals needed — Redis, the workers, and the producer all run as
-containers:
-
-```bash
-docker compose up --build --scale worker=3
-```
-
-This starts Redis, 3 background workers, and the producer (which enqueues 10
-tasks and exits). You'll see the workers' logs stream and interleave as they
-share the tasks. Stop everything with `Ctrl-C`, then clean up with:
-
-```bash
-docker compose down
-```
-
-To enqueue another batch while the workers keep running:
-
-```bash
-docker compose run --rm producer
-```
-
-(Adjust `--scale worker=N` for more or fewer workers.)
-
-## Running it locally (without Docker)
-
-### 1. Start Redis
-
-```bash
-docker compose up -d
-```
-
-(or point `REDIS_URL` at any Redis you already have, e.g.
-`export REDIS_URL=redis://localhost:6379/0`)
-
-### 2. Install the dependency
+### 1. Install the dependency
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3a. Quick all-in-one demo
+### 2. Run the demo
 
 ```bash
 python demo.py
 ```
 
-You'll see the workers' `processing` / `done` lines interleave, then
-`All tasks processed.`
+You'll see the workers' `processing` / `done` lines interleave, then a final
+breakdown like `{'done': 10}`. The queue lives in `tasks.duckdb`.
 
-### 3b. Realistic multi-process version
-
-Open three terminals:
+### 3. Inspect the persisted queue with SQL
 
 ```bash
-python worker.py     # terminal 1 — a worker, waits for tasks
-python worker.py     # terminal 2 — another worker
-python producer.py   # terminal 3 — drops 10 tasks on the queue
+duckdb tasks.duckdb "SELECT status, count(*) FROM tasks GROUP BY status"
+duckdb tasks.duckdb "SELECT * FROM tasks LIMIT 5"
 ```
 
-Watch the two workers split the tasks between them. Stop a worker with `Ctrl-C`.
+(Point the demo at a different file with `export DUCKDB_PATH=/path/to/my.duckdb`.)
 
-### Peek at the queue
+## Running it with Docker
+
+DuckDB needs no server, so the whole demo runs in a single container:
 
 ```bash
-redis-cli LLEN tasks   # number of tasks waiting
+docker compose up --build
+```
+
+The DuckDB file is written to `./data/tasks.duckdb` on the host (via a mounted
+volume), so it persists after the container exits. Clean up with:
+
+```bash
+docker compose down
 ```

@@ -1,1 +1,1 @@
-redis>=5.0
+duckdb>=1.0

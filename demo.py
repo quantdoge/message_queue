@@ -4,13 +4,13 @@ It:
   1. starts a few background workers (each in its own thread),
   2. enqueues a batch of tasks,
   3. waits for the queue to drain,
-  4. asks the workers to stop, and joins them.
+  4. asks the workers to stop, and joins them,
+  5. prints the final pending/processing/done breakdown.
 
 Watch the output: the workers' "processing"/"done" lines interleave, which
-shows several tasks being handled at the same time.
-
-For the more realistic multi-process version, run worker.py in a couple of
-terminals and producer.py in another instead.
+shows several tasks being handled at the same time. Everything shares one
+DuckDB connection, so this all runs as a single process (DuckDB only allows
+one read-write process on the file at a time).
 """
 
 import threading
@@ -26,6 +26,7 @@ NUM_TASKS = 10
 
 def main() -> None:
     queue = TaskQueue()
+    queue.clear()  # start each run from a clean table
 
     # 1. Start the background workers.
     workers = [Worker(name=f"worker-{i}", queue=queue) for i in range(1, NUM_WORKERS + 1)]
@@ -38,7 +39,7 @@ def main() -> None:
     enqueue_sample_tasks(queue, n=NUM_TASKS)
     print("-" * 50)
 
-    # 3. Wait until every task has been picked up off the queue.
+    # 3. Wait until every task has been processed (pending + processing == 0).
     while queue.size() > 0:
         time.sleep(0.2)
 
@@ -48,8 +49,10 @@ def main() -> None:
     for t in threads:
         t.join()
 
+    # 5. Show the final state, which also lives in the DuckDB file on disk.
     print("-" * 50)
-    print("All tasks processed. Demo complete.")
+    print(f"All tasks processed. Final breakdown: {queue.stats()}")
+    print(f"Inspect it any time with:  duckdb {queue.db_path} \"SELECT * FROM tasks\"")
 
 
 if __name__ == "__main__":

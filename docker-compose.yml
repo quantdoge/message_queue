@@ -1,33 +1,10 @@
 services:
-  # The Redis server that holds the task queue.
-  redis:
-    image: redis:7
-    ports:
-      - "6379:6379"
-    # Let other services wait until Redis is actually ready to accept commands.
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 1s
-      timeout: 3s
-      retries: 30
-
-  # Background workers. Scale to several at once with:
-  #   docker compose up --build --scale worker=3
-  worker:
+  # DuckDB is embedded (no server), so the whole demo runs in one container.
+  # The DuckDB file is written under ./data on the host so it persists.
+  demo:
     build: .
-    command: python worker.py
+    command: python demo.py
     environment:
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      redis:
-        condition: service_healthy
-
-  # Runs once to drop a batch of tasks on the queue, then exits.
-  producer:
-    build: .
-    command: python producer.py
-    environment:
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      redis:
-        condition: service_healthy
+      DUCKDB_PATH: /app/data/tasks.duckdb
+    volumes:
+      - ./data:/app/data

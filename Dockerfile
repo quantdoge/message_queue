@@ -12,5 +12,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Default to running a worker; the producer service overrides this command.
-CMD ["python", "worker.py"]
+# Run the all-in-one demo by default.
+CMD ["python", "demo.py"]
