@@ -3,13 +3,13 @@
 DuckDB is an embedded database (like SQLite), not a server, so there is no
 blocking pop or pub/sub. Instead the queue is just a table, and the pattern is:
 
-    enqueue  ->  INSERT a row with status 'pending'
-    dequeue  ->  atomically CLAIM the oldest pending row:
-                 UPDATE ... SET status='processing' ... RETURNING
-    complete ->  UPDATE that row's status to 'done'
+    enqueue      ->  INSERT a row with status 'queued'
+    dequeue      ->  atomically CLAIM the oldest queued row:
+                     UPDATE ... SET status='processing' ... RETURNING
+    succeed      ->  UPDATE that row's status to 'success', store result JSON
+    fail         ->  UPDATE that row's status to 'failed', store error message
 
-Each task therefore moves through three states:  pending -> processing -> done.
-Ordering by an auto-incrementing row id gives FIFO (oldest pending runs next).
+Each task moves through:  queued -> processing -> success | failed
 
 Concurrency note: a single DuckDB connection is not safe to use from several
 threads at once, so every database call here is wrapped in a threading.Lock.
@@ -24,7 +24,6 @@ import time
 
 import duckdb
 
-# Where the DuckDB database file lives. Override with DUCKDB_PATH.
 DB_PATH = os.environ.get("DUCKDB_PATH", "tasks.duckdb")
 
 
@@ -33,53 +32,76 @@ class TaskQueue:
 
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
-        # One shared connection, guarded by a lock (see module docstring).
         self.conn = duckdb.connect(db_path)
         self.lock = threading.Lock()
         self._create_schema()
 
     def _create_schema(self) -> None:
         with self.lock:
-            # A sequence supplies the auto-incrementing row id used for FIFO order.
             self.conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_row START 1")
             self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
                     row_id     BIGINT PRIMARY KEY DEFAULT nextval('seq_row'),
-                    payload    VARCHAR NOT NULL,                    -- JSON task dict
-                    status     VARCHAR NOT NULL DEFAULT 'pending',  -- pending|processing|done
-                    created_at TIMESTAMP DEFAULT now()
+                    payload    VARCHAR NOT NULL,
+                    status     VARCHAR NOT NULL DEFAULT 'queued',
+                    result     VARCHAR,
+                    error      VARCHAR,
+                    created_at TIMESTAMP DEFAULT now(),
+                    updated_at TIMESTAMP DEFAULT now()
                 )
                 """
             )
+            # Migrate tables created before result/error/updated_at columns existed
+            for col, defn in [
+                ("result", "VARCHAR"),
+                ("error", "VARCHAR"),
+                ("updated_at", "TIMESTAMP DEFAULT now()"),
+            ]:
+                try:
+                    self.conn.execute(
+                        f"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS {col} {defn}"
+                    )
+                except Exception:
+                    pass
 
-    def enqueue(self, task: dict) -> None:
-        """Add a task (a plain dict) to the back of the queue."""
+    # ------------------------------------------------------------------
+    # Enqueue helpers
+    # ------------------------------------------------------------------
+
+    def enqueue(self, task: dict) -> int:
+        """Add a task dict to the queue. Returns the assigned ticket id."""
         with self.lock:
-            self.conn.execute(
-                "INSERT INTO tasks (payload) VALUES (?)", [json.dumps(task)]
-            )
+            (row_id,) = self.conn.execute(
+                "INSERT INTO tasks (payload) VALUES (?) RETURNING row_id",
+                [json.dumps(task)],
+            ).fetchone()
+        return row_id
+
+    def enqueue_file(self, filename: str, file_data_b64: str) -> int:
+        """Enqueue a file upload clustering task. Returns the ticket id."""
+        payload = {"filename": filename, "file_data": file_data_b64}
+        return self.enqueue(payload)
+
+    # ------------------------------------------------------------------
+    # Worker-facing methods
+    # ------------------------------------------------------------------
 
     def dequeue(self, timeout: int = 2):
-        """Claim and return the oldest pending task as a dict.
-
-        DuckDB has no blocking pop, so we poll: we try to claim the oldest
-        pending row; if there is none we wait briefly and try again, until
-        `timeout` seconds have passed, at which point we return None. Returning
-        None lets a worker re-check whether it has been asked to shut down.
-        """
+        """Claim and return the oldest queued task as a dict, or None on timeout."""
         deadline = time.monotonic() + timeout
         while True:
             with self.lock:
-                # Atomically grab the oldest pending row and mark it 'processing'.
                 row = self.conn.execute(
                     """
-                    UPDATE tasks SET status = 'processing'
-                    WHERE row_id = (
+                    UPDATE tasks
+                    SET    status     = 'processing',
+                           updated_at = now()
+                    WHERE  row_id = (
                         SELECT row_id FROM tasks
-                        WHERE status = 'pending'
-                        ORDER BY row_id
-                        LIMIT 1
+                        WHERE  status = 'queued'
+                        ORDER  BY row_id
+                        LIMIT  1
                     )
                     RETURNING row_id, payload
                     """
@@ -87,31 +109,63 @@ class TaskQueue:
             if row is not None:
                 row_id, payload = row
                 task = json.loads(payload)
-                # Remember which DB row this came from so complete() can find it.
                 task["_row_id"] = row_id
                 return task
             if time.monotonic() >= deadline:
                 return None
-            time.sleep(0.1)  # nothing waiting; pause before polling again
+            time.sleep(0.1)
 
-    def complete(self, task: dict) -> None:
-        """Mark a claimed task as done."""
+    def succeed(self, task: dict, result: str) -> None:
+        """Mark a task as successfully completed and store the result JSON."""
         with self.lock:
             self.conn.execute(
-                "UPDATE tasks SET status = 'done' WHERE row_id = ?",
-                [task["_row_id"]],
+                "UPDATE tasks SET status = 'success', result = ?, updated_at = now() WHERE row_id = ?",
+                [result, task["_row_id"]],
             )
 
+    def fail(self, task: dict, error: str) -> None:
+        """Mark a task as failed and store the error message."""
+        with self.lock:
+            self.conn.execute(
+                "UPDATE tasks SET status = 'failed', error = ?, updated_at = now() WHERE row_id = ?",
+                [error, task["_row_id"]],
+            )
+
+    def complete(self, task: dict) -> None:
+        """Backward-compatible alias: mark done with no result."""
+        self.succeed(task, result="")
+
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
+
+    def get_task(self, ticket_id: int) -> dict | None:
+        """Return status (and result/error if finished) for a ticket, or None."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT row_id, status, result, error FROM tasks WHERE row_id = ?",
+                [ticket_id],
+            ).fetchone()
+        if row is None:
+            return None
+        row_id, status, result, error = row
+        out = {"ticket_id": row_id, "status": status}
+        if status == "success":
+            out["result"] = json.loads(result) if result else []
+        if status == "failed":
+            out["error"] = error
+        return out
+
     def size(self) -> int:
-        """How many tasks are not yet done (pending + processing)."""
+        """How many tasks are not yet finished (queued + processing)."""
         with self.lock:
             (count,) = self.conn.execute(
-                "SELECT count(*) FROM tasks WHERE status <> 'done'"
+                "SELECT count(*) FROM tasks WHERE status NOT IN ('success', 'failed')"
             ).fetchone()
         return count
 
     def stats(self) -> dict:
-        """Return a {status: count} breakdown, handy for a final summary."""
+        """Return a {status: count} breakdown."""
         with self.lock:
             rows = self.conn.execute(
                 "SELECT status, count(*) FROM tasks GROUP BY status"
@@ -119,6 +173,6 @@ class TaskQueue:
         return {status: count for status, count in rows}
 
     def clear(self) -> None:
-        """Remove all tasks so a fresh demo run starts clean."""
+        """Remove all tasks."""
         with self.lock:
             self.conn.execute("DELETE FROM tasks")
