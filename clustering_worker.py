@@ -16,7 +16,9 @@ Pipeline per task
        min_samples = 2 × dimensions
        eps         = k-distance graph knee (KneeLocator, S=1)
 8. Run DBSCAN; label outliers as "outlier".
-9. Return JSON list of {row_id, cluster} dicts.
+9. Save one row per cluster into the cluster_results table:
+       ticket_id, cluster label, index_list (JSON array), summary text.
+   Summary is computed on original (unscaled, pre-PCA) valid feature values.
 """
 
 import base64
@@ -46,17 +48,19 @@ class ClusteringWorker(Worker):
             task = self.queue.dequeue(timeout=2)
             if task is None:
                 continue
+            ticket_id = task["_row_id"]
             try:
-                result_json = self.process(task)
-                self.queue.succeed(task, result_json)
-                print(f"[{self.name}] ticket {task['_row_id']} succeeded")
+                cluster_rows = self.process(task)
+                self.queue.save_cluster_results(ticket_id, cluster_rows)
+                self.queue.succeed(task)
+                print(f"[{self.name}] ticket {ticket_id} succeeded ({len(cluster_rows)} clusters)")
             except Exception as exc:
-                error_msg = traceback.format_exc()
-                self.queue.fail(task, error_msg)
-                print(f"[{self.name}] ticket {task['_row_id']} failed: {exc}")
+                self.queue.fail(task, traceback.format_exc())
+                print(f"[{self.name}] ticket {ticket_id} failed: {exc}")
         print(f"[{self.name}] stopped.")
 
-    def process(self, task: dict) -> str:  # type: ignore[override]
+    def process(self, task: dict) -> list[dict]:  # type: ignore[override]
+        """Run the full clustering pipeline and return per-cluster result rows."""
         file_bytes = base64.b64decode(task["file_data"])
         filename = task["filename"]
 
@@ -99,8 +103,7 @@ class ClusteringWorker(Worker):
             valid_num = [col for col, keep in zip(num_cols, selector.get_support()) if keep]
             scaled_num_df = scaled_num_df[valid_num]
 
-        n_valid_features = len(valid_cat) + len(valid_num)
-        if n_valid_features == 0:
+        if len(valid_cat) + len(valid_num) == 0:
             raise ValueError("No valid features remain after filtering.")
 
         # ------------------------------------------------------------------
@@ -124,7 +127,6 @@ class ClusteringWorker(Worker):
 
         # ------------------------------------------------------------------
         # PCA: reduce to 5 dimensions when post-encoding column count >= 5
-        # (X.shape[1] is the true dimensionality after all encoding steps)
         # ------------------------------------------------------------------
         if X.shape[1] >= 5:
             n_components = min(5, X.shape[1], n_rows - 1)
@@ -166,13 +168,71 @@ class ClusteringWorker(Worker):
         labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(X)
 
         # ------------------------------------------------------------------
-        # f. Build result JSON
+        # f. Build per-cluster DB rows (summaries use original unscaled values)
         # ------------------------------------------------------------------
-        result = [
-            {"row_id": i, "cluster": "outlier" if label == -1 else int(label)}
-            for i, label in enumerate(labels)
-        ]
-        return json.dumps(result)
+        return self._build_cluster_rows(df, labels, valid_cat, valid_num)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _build_cluster_rows(
+        self,
+        df: pd.DataFrame,
+        labels: np.ndarray,
+        valid_cat: list[str],
+        valid_num: list[str],
+    ) -> list[dict]:
+        """Return one dict per cluster, ready to insert into cluster_results."""
+        rows = []
+        for label in sorted(set(labels)):
+            mask = labels == label
+            indices = [int(i) for i in np.where(mask)[0]]
+            cluster_label = "outlier" if label == -1 else str(int(label))
+            cluster_df = df.iloc[indices]
+            summary = self._summarize_cluster(cluster_label, cluster_df, valid_cat, valid_num)
+            rows.append({
+                "cluster": cluster_label,
+                "index_list": json.dumps(indices),
+                "summary": summary,
+            })
+        return rows
+
+    def _summarize_cluster(
+        self,
+        cluster_label: str,
+        cluster_df: pd.DataFrame,
+        valid_cat: list[str],
+        valid_num: list[str],
+    ) -> str:
+        """Build a human-readable summary of a cluster using original feature values."""
+        n = len(cluster_df)
+        heading = (
+            f"Outlier group — {n} record{'s' if n != 1 else ''}"
+            if cluster_label == "outlier"
+            else f"Cluster {cluster_label} — {n} record{'s' if n != 1 else ''}"
+        )
+        lines = [heading]
+
+        if valid_cat:
+            lines.append("\nCategorical features:")
+            for col in valid_cat:
+                counts = cluster_df[col].value_counts(normalize=True)
+                top = ", ".join(
+                    f'"{v}" ({p * 100:.1f}%)' for v, p in counts.head(5).items()
+                )
+                lines.append(f"  {col}: {top}")
+
+        if valid_num:
+            lines.append("\nNumerical features:")
+            for col in valid_num:
+                s = cluster_df[col].dropna().describe()
+                lines.append(
+                    f"  {col}: mean={s['mean']:.2f}, std={s['std']:.2f}, "
+                    f"min={s['min']:.2f}, max={s['max']:.2f}"
+                )
+
+        return "\n".join(lines)
 
 
 if __name__ == "__main__":
