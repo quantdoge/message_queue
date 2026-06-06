@@ -7,8 +7,11 @@ Pipeline per task
 3. Discard unhelpful categoricals (all-unique or constant).
 4. Scale numericals with StandardScaler then drop low-variance ones
    (VarianceThreshold = 0.05).
-5. One-hot-encode remaining categoricals and join with scaled numericals.
-6. If total valid feature count >= 5, apply PCA to 5 components.
+5. Frequency-encode remaining categoricals (replace each value with its
+   relative frequency in the column) and join with scaled numericals.
+   This keeps exactly 1 column per categorical feature — no dimensionality
+   explosion — and preserves rarity signal useful for audit sampling.
+6. If actual post-encoding column count >= 5, apply PCA to 5 components.
 7. Determine DBSCAN parameters automatically:
        min_samples = 2 × dimensions
        eps         = k-distance graph knee (KneeLocator, S=1)
@@ -101,23 +104,29 @@ class ClusteringWorker(Worker):
             raise ValueError("No valid features remain after filtering.")
 
         # ------------------------------------------------------------------
-        # Build feature matrix
+        # Build feature matrix — frequency-encode categoricals
+        # Each category value is replaced by its relative frequency in that
+        # column (value_counts normalised). This produces exactly 1 column
+        # per categorical feature, avoiding the dimensionality explosion of
+        # one-hot encoding and preserving rarity signal for audit sampling.
         # ------------------------------------------------------------------
         parts: list[pd.DataFrame] = []
         if valid_num:
             parts.append(scaled_num_df.reset_index(drop=True))
         if valid_cat:
-            dummies = pd.get_dummies(
-                df[valid_cat].reset_index(drop=True), drop_first=False
-            )
-            parts.append(dummies.astype(float))
+            freq_df = df[valid_cat].copy().reset_index(drop=True)
+            for col in valid_cat:
+                freq_map = freq_df[col].value_counts(normalize=True)
+                freq_df[col] = freq_df[col].map(freq_map).astype(float)
+            parts.append(freq_df)
 
         X = pd.concat(parts, axis=1).values.astype(float)
 
         # ------------------------------------------------------------------
-        # PCA: reduce to 5 dimensions when there are >= 5 valid features
+        # PCA: reduce to 5 dimensions when post-encoding column count >= 5
+        # (X.shape[1] is the true dimensionality after all encoding steps)
         # ------------------------------------------------------------------
-        if n_valid_features >= 5:
+        if X.shape[1] >= 5:
             n_components = min(5, X.shape[1], n_rows - 1)
             X = PCA(n_components=n_components).fit_transform(X)
             n_dims = n_components
